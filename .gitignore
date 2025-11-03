@@ -1,0 +1,165 @@
+# EthUDP Project .gitignore
+
+# Build directories and compiled objects
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Executables
+EthUDP
+ethudp
+/EthUDP
+/ethudp
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.gch
+*.pch
+
+# Core dumps and crash files
+core
+core.*
+vgcore.*
+*.core
+*.dump
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.#*
+#*#
+*.swp
+*.swo
+*.bak
+*.orig
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Log files
+*.log
+*.out
+*.err
+logs/
+log/
+
+# Configuration files (local)
+config.local
+*.local
+.env
+.env.local
+
+# IDE and editor files
+.vscode/
+.idea/
+.trae/
+*.sublime-*
+*.code-workspace
+tags
+TAGS
+.ctags
+.gtags
+.gpath
+.glo
+
+# Profiling and analysis
+gmon.out
+*.gcov
+*.gcda
+*.gcno
+callgrind.out.*
+cachegrind.out.*
+massif.out.*
+perf.data*
+
+# Memory debugging
+valgrind-*.log
+*.memcheck
+*.helgrind
+*.drd
+
+# Package files
+*.tar.gz
+*.tgz
+*.zip
+*.rar
+*.7z
+
+# Backup files
+*~
+*.backup
+*.old
+*.save
+
+# Network capture files
+*.pcap
+*.pcapng
+*.cap
+
+# VLAN mapping files (if they contain sensitive data)
+vlanmap.txt
+*.vlanmap
+
+# Test results
+test_results/
+coverage/
+*.coverage
+
+# Documentation build
+docs/_build/
+docs/html/
+docs/latex/
+
+# Autotools
+autom4te.cache/
+config.h.in~
+configure
+config.log
+config.status
+config.h
+Makefile.in
+aclocal.m4
+compile
+depcomp
+install-sh
+missing
+stamp-h1
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+
+# Clang
+.clangd/
+compile_commands.json
+
+# Static analysis
+cppcheck-*.xml
+scan-build-*/
+
+# Performance monitoring
+*.perf
+*.flame
+*.svg
+
+# Lock files
+*.lock
