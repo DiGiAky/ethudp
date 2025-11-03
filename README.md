@@ -8,18 +8,40 @@ Ethernet over UDP, similar of VXLAN, transport Ethernet packet via UDP, support 
 
 [Sample config](sample/README.md)
 
-## package needs to compile
+## Dependencies and Compilation Requirements
 
-CentOS:
+### Required Libraries
+
+EthUDP requires the following libraries to compile and run:
+- **OpenSSL** (`libssl`, `libcrypto`) - For encryption and cryptographic functions
+- **LZ4** (`liblz4`) - For data compression
+- **libpcap** (`libpcap`) - For packet capture functionality
+- **pthread** (`libpthread`) - For multi-threading support (usually included with glibc)
+- **Math library** (`libm`) - For mathematical functions (usually included with glibc)
+
+### Optional Libraries
+
+- **NUMA** (`libnuma`) - For NUMA-aware memory allocation and CPU affinity (recommended for high-performance deployments)
+
+### Installation Instructions
+
+#### CentOS/RHEL/Fedora:
+````bash
+# CentOS/RHEL 7/8
+sudo yum install openssl-devel lz4-devel libpcap-devel numactl-devel
+
+# CentOS/RHEL 9+ / Fedora
+sudo dnf install openssl-devel lz4-devel libpcap-devel numactl-devel
 ````
-openssl-devel lz4-devel libpcap-devel
+
+#### Debian/Ubuntu:
+````bash
+sudo apt-get update
+sudo apt-get install libssl-dev liblz4-dev libpcap-dev libnuma-dev build-essential
 ````
-Debian
-````
-libssl-dev liblz4-dev libpcap-dev
-````
-and Debian liblz4 miss LZ4_compress_fast, you need rebuild it as https://github.com/facebook/mcrouter/issues/149
-````
+
+**Note for Debian users:** Some older Debian versions have an incomplete LZ4 implementation missing `LZ4_compress_fast`. If you encounter compilation errors, rebuild LZ4 as follows:
+````bash
 apt-get install dpkg-dev debhelper
 echo "deb-src http://ftp.de.debian.org/debian/ stretch main" > /etc/apt/sources.list.d/stretch-source-packages.list
 apt-get update
@@ -27,7 +49,56 @@ apt-get source lz4=0.0~r131-2
 cd lz4-0.0~r131
 dpkg-buildpackage -rfakeroot -uc -b
 cd ..
-dpkg -i liblz4-1_0.0~r131-2_amd64.deb liblz4-dev_0.0~r131-2_amd64.deb
+sudo dpkg -i liblz4-1_0.0~r131-2_amd64.deb liblz4-dev_0.0~r131-2_amd64.deb
+````
+
+#### Arch Linux:
+````bash
+sudo pacman -S openssl lz4 libpcap numactl
+````
+
+#### Alpine Linux:
+````bash
+sudo apk add openssl-dev lz4-dev libpcap-dev numactl-dev build-base linux-headers
+````
+
+### Checking Dependencies
+
+You can verify that all required dependencies are installed using:
+````bash
+make check-deps
+````
+
+### Compilation Options
+
+#### Standard build (with all features):
+````bash
+make
+````
+
+#### Optimized production build:
+````bash
+make production
+````
+
+#### Build without NUMA support (if libnuma is not available):
+````bash
+make no-numa
+````
+
+### Development Tools (Optional)
+
+For development and code analysis, you may also want to install:
+````bash
+# Static analysis tools
+sudo apt-get install cppcheck clang-tidy  # Debian/Ubuntu
+sudo dnf install cppcheck clang-tools-extra  # Fedora
+sudo pacman -S cppcheck clang  # Arch Linux
+
+# Code formatting
+sudo apt-get install indent  # Debian/Ubuntu
+sudo dnf install indent  # Fedora
+sudo pacman -S indent  # Arch Linux
 ````
 
 ## Increasing Linux kernel network buffers
