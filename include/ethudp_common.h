@@ -60,7 +60,7 @@
 #include <openssl/evp.h>
 #define AES_128 2
 #define AES_192 3
-#define AES_256 3
+#define AES_256 4
 #else
 #define EVP_MAX_BLOCK_LENGTH 0
 #endif
@@ -148,6 +148,10 @@
 #define CONFIG_LINE_MAX             256
 #define CONFIG_KEY_MAX              64
 #define CONFIG_VALUE_MAX            128
+
+// Loopback detection constants
+#define LOOPBACK_HISTORY_SIZE       64      // Number of recent packets to track
+#define LOOPBACK_THRESHOLD          10      // Max duplicate packets before loop detection
 
 // VLAN support
 #ifdef HAVE_PACKET_AUXDATA

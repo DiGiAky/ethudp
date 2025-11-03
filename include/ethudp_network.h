@@ -436,6 +436,52 @@ ssize_t ethudp_decompress_packet(const void *data, size_t len,
                                 void *decompressed_data, size_t buffer_size);
 
 // ============================================================================
+// CORE PROCESSING FUNCTIONS
+// ============================================================================
+
+/**
+ * UDP to RAW worker thread function
+ * @param arg Worker context
+ * @return NULL
+ */
+void* process_udp_to_raw_worker(void *arg);
+
+/**
+ * RAW to UDP worker thread function
+ * @param arg Worker context
+ * @return NULL
+ */
+void* process_raw_to_udp_worker(void *arg);
+
+/**
+ * UDP to RAW master processing function
+ * @param arg Thread argument (unused)
+ * @return NULL
+ */
+void* process_udp_to_raw_master(void *arg);
+
+/**
+ * RAW to UDP main processing function
+ */
+void process_raw_to_udp(void);
+
+/**
+ * Fix MSS in TCP packets
+ * @param buf Packet buffer
+ * @param len Packet length
+ * @return Processed length, -1 on error
+ */
+int fix_mss(uint8_t *buf, int len);
+
+/**
+ * Check if packet should be dropped due to loopback
+ * @param buf Packet buffer
+ * @param len Packet length
+ * @return 1 if should drop, 0 if should process, -1 on error
+ */
+int do_loopback_check(uint8_t *buf, int len);
+
+// ============================================================================
 // NETWORK UTILITIES
 // ============================================================================
 

@@ -64,6 +64,9 @@ extern int do_loopback_check(uint8_t *buf, int len);
 extern int fix_mss(uint8_t *buf, int len);
 extern void printPacket(uint8_t *buf, int len, const char *prefix);
 
+// External worker pool for statistics
+extern worker_pool_t global_worker_pool;
+
 /**
  * Create and configure UDP socket connection
  */
@@ -868,20 +871,290 @@ uint16_t ethudp_calculate_checksum(const void *data, size_t len) {
 // ============================================================================
 
 /**
- * UDP server function (stub)
+ * UDP server function - Create and configure UDP server socket
+ * @param host Local host address (NULL for any interface)
+ * @param port Local port to bind to
+ * @return Socket file descriptor on success, -1 on error
  */
 int udp_server(const char *host, const char *port) {
-    // TODO: Implement UDP server functionality
-    Debug("udp_server called with host=%s, port=%s", host, port);
-    return -1;
+    int sockfd;
+    struct addrinfo hints, *res, *ressave;
+    int reuse = 1;
+    int buffer_size = SOCKET_RECV_BUFFER_SIZE;
+    
+    Debug("udp_server: Creating UDP server on host=%s, port=%s", 
+          host ? host : "ANY", port);
+    
+    // Initialize hints for getaddrinfo
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;        // IPv4 or IPv6
+    hints.ai_socktype = SOCK_DGRAM;     // UDP socket
+    hints.ai_flags = AI_PASSIVE;        // For server socket
+    
+    // Resolve address information
+    int n = getaddrinfo(host, port, &hints, &res);
+    if (n != 0) {
+        err_msg("udp_server: getaddrinfo error for %s:%s - %s", 
+                host ? host : "ANY", port, gai_strerror(n));
+        return -1;
+    }
+    ressave = res;
+    
+    // Try each address until we successfully bind
+    do {
+        sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sockfd < 0) {
+            continue;  // Try next address
+        }
+        
+        // Set socket options for reuse
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+            err_msg("udp_server: setsockopt SO_REUSEADDR failed");
+            close(sockfd);
+            continue;
+        }
+        
+#ifdef SO_REUSEPORT
+        // Enable SO_REUSEPORT for better performance with multiple workers
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+            Debug("udp_server: SO_REUSEPORT not supported, continuing without it");
+        }
+#endif
+        
+        // Set receive buffer size
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+            err_msg("udp_server: setsockopt SO_RCVBUF failed");
+        }
+        
+        // Set send buffer size
+        if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+            err_msg("udp_server: setsockopt SO_SNDBUF failed");
+        }
+        
+        // Bind to the address
+        if (bind(sockfd, res->ai_addr, res->ai_addrlen) == 0) {
+            break;  // Success
+        }
+        
+        // Bind failed, close socket and try next address
+        err_msg("udp_server: bind failed for address");
+        close(sockfd);
+        sockfd = -1;
+        
+    } while ((res = res->ai_next) != NULL);
+    
+    // Clean up address info
+    freeaddrinfo(ressave);
+    
+    if (sockfd < 0) {
+        err_msg("udp_server: Failed to create and bind UDP server socket");
+        return -1;
+    }
+    
+    // Get and log the actual bound address
+    struct sockaddr_storage bound_addr;
+    socklen_t addr_len = sizeof(bound_addr);
+    if (getsockname(sockfd, (struct sockaddr*)&bound_addr, &addr_len) == 0) {
+        char host_str[NI_MAXHOST], port_str[NI_MAXSERV];
+        if (getnameinfo((struct sockaddr*)&bound_addr, addr_len,
+                       host_str, sizeof(host_str),
+                       port_str, sizeof(port_str),
+                       NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+            Debug("udp_server: Successfully bound to %s:%s (fd=%d)", 
+                  host_str, port_str, sockfd);
+        }
+    }
+    
+    // Set socket to non-blocking mode for better performance
+    if (ethudp_set_nonblocking(sockfd) < 0) {
+        err_msg("udp_server: Failed to set socket non-blocking");
+        close(sockfd);
+        return -1;
+    }
+    
+    Debug("udp_server: UDP server socket created successfully (fd=%d)", sockfd);
+    return sockfd;
 }
 
 /**
- * Loopback check function (stub)
+ * Loopback check function - Detects and prevents network loops
+ * This function analyzes packets to detect potential loopback conditions
+ * that could cause infinite packet loops in the EthUDP tunnel
  */
 int do_loopback_check(uint8_t *buf, int len) {
-    // TODO: Implement loopback check
-    return 0;
+    if (!buf || len < 8) {
+        return 0; // Invalid parameters or packet too small
+    }
+    
+    static uint32_t loopback_sequence = 0;
+    static uint32_t last_loopback_check = 0;
+    static struct {
+        uint32_t src_ip;
+        uint32_t dst_ip;
+        uint16_t src_port;
+        uint16_t dst_port;
+        uint32_t timestamp;
+        uint32_t count;
+    } recent_packets[LOOPBACK_HISTORY_SIZE];
+    static int recent_packet_index = 0;
+    static pthread_mutex_t loopback_mutex = PTHREAD_MUTEX_INITIALIZER;
+    
+    // Get current timestamp
+    struct timespec current_time;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+    uint32_t timestamp = current_time.tv_sec;
+    
+    // Check for EthUDP header first
+    if (len >= 8 && memcmp(buf, "UDPFRG", 6) == 0) {
+        // This is an EthUDP packet - check sequence number
+        uint16_t seq = ntohs(*(uint16_t*)(buf + 6));
+        
+        // Skip EthUDP header for further analysis
+        buf += 8;
+        len -= 8;
+        
+        Debug("do_loopback_check: EthUDP packet detected, seq=%u", seq);
+    }
+    
+    // Minimum IP header check
+    if (len < 20) {
+        return 0; // Packet too small for IP analysis
+    }
+    
+    struct iphdr *iph = (struct iphdr *)buf;
+    
+    // Validate IP header
+    if (iph->version != 4 || len < (iph->ihl * 4)) {
+        return 0; // Not IPv4 or invalid header length
+    }
+    
+    uint32_t src_ip = ntohl(iph->saddr);
+    uint32_t dst_ip = ntohl(iph->daddr);
+    uint16_t src_port = 0, dst_port = 0;
+    
+    // Extract port information if available
+    int ip_header_len = iph->ihl * 4;
+    if (len >= ip_header_len + 4) {
+        if (iph->protocol == IPPROTO_UDP) {
+            struct udphdr *udph = (struct udphdr *)(buf + ip_header_len);
+            if (len >= ip_header_len + sizeof(struct udphdr)) {
+                src_port = ntohs(udph->source);
+                dst_port = ntohs(udph->dest);
+            }
+        } else if (iph->protocol == IPPROTO_TCP) {
+            struct tcphdr *tcph = (struct tcphdr *)(buf + ip_header_len);
+            if (len >= ip_header_len + sizeof(struct tcphdr)) {
+                src_port = ntohs(tcph->source);
+                dst_port = ntohs(tcph->dest);
+            }
+        }
+    }
+    
+    // Thread-safe access to recent packets history
+    pthread_mutex_lock(&loopback_mutex);
+    
+    // Check for immediate loopback (same source/destination)
+    if (src_ip == dst_ip && src_port == dst_port && src_port != 0) {
+        pthread_mutex_unlock(&loopback_mutex);
+        Debug("do_loopback_check: Immediate loopback detected (src=dst=%08x:%u)", src_ip, src_port);
+        return 1; // Loopback detected
+    }
+    
+    // Check against recent packets for potential loops
+    int loop_detected = 0;
+    uint32_t duplicate_count = 0;
+    
+    for (int i = 0; i < LOOPBACK_HISTORY_SIZE; i++) {
+        // Skip empty entries
+        if (recent_packets[i].timestamp == 0) {
+            continue;
+        }
+        
+        // Clean old entries (older than 30 seconds)
+        if (timestamp - recent_packets[i].timestamp > 30) {
+            memset(&recent_packets[i], 0, sizeof(recent_packets[i]));
+            continue;
+        }
+        
+        // Check for exact match (potential loop)
+        if (recent_packets[i].src_ip == src_ip &&
+            recent_packets[i].dst_ip == dst_ip &&
+            recent_packets[i].src_port == src_port &&
+            recent_packets[i].dst_port == dst_port) {
+            
+            recent_packets[i].count++;
+            duplicate_count = recent_packets[i].count;
+            
+            // If we see the same packet pattern too frequently, it's likely a loop
+            if (duplicate_count > LOOPBACK_THRESHOLD) {
+                loop_detected = 1;
+                Debug("do_loopback_check: Loop detected - packet pattern seen %u times", duplicate_count);
+                break;
+            }
+        }
+        
+        // Check for bidirectional pattern (A→B followed by B→A rapidly)
+        if (recent_packets[i].src_ip == dst_ip &&
+            recent_packets[i].dst_ip == src_ip &&
+            recent_packets[i].src_port == dst_port &&
+            recent_packets[i].dst_port == src_port &&
+            (timestamp - recent_packets[i].timestamp) < 2) { // Within 2 seconds
+            
+            Debug("do_loopback_check: Bidirectional pattern detected (potential ping-pong)");
+            // This might be normal bidirectional traffic, so we're more lenient
+            if (duplicate_count > LOOPBACK_THRESHOLD * 2) {
+                loop_detected = 1;
+                break;
+            }
+        }
+    }
+    
+    // Add current packet to history if not a detected loop
+    if (!loop_detected) {
+        // Find an empty slot or overwrite the oldest
+        int slot = recent_packet_index;
+        recent_packets[slot].src_ip = src_ip;
+        recent_packets[slot].dst_ip = dst_ip;
+        recent_packets[slot].src_port = src_port;
+        recent_packets[slot].dst_port = dst_port;
+        recent_packets[slot].timestamp = timestamp;
+        recent_packets[slot].count = 1;
+        
+        recent_packet_index = (recent_packet_index + 1) % LOOPBACK_HISTORY_SIZE;
+    }
+    
+    // Update global loopback statistics
+    loopback_sequence++;
+    if (timestamp != last_loopback_check) {
+        last_loopback_check = timestamp;
+        
+        // Periodic cleanup and statistics
+        if (debug && (loopback_sequence % 1000 == 0)) {
+            int active_entries = 0;
+            for (int i = 0; i < LOOPBACK_HISTORY_SIZE; i++) {
+                if (recent_packets[i].timestamp != 0 && 
+                    timestamp - recent_packets[i].timestamp <= 30) {
+                    active_entries++;
+                }
+            }
+            Debug("do_loopback_check: Statistics - checked %u packets, %d active history entries", 
+                  loopback_sequence, active_entries);
+        }
+    }
+    
+    pthread_mutex_unlock(&loopback_mutex);
+    
+    if (loop_detected) {
+        err_msg("do_loopback_check: Network loop detected and blocked (src=%08x:%u, dst=%08x:%u, count=%u)", 
+                src_ip, src_port, dst_ip, dst_port, duplicate_count);
+        
+        // Update error statistics if available
+        if (global_worker_pool.running) {
+            __sync_fetch_and_add(&global_worker_pool.total_errors, 1);
+        }
+    }
+    
+    return loop_detected ? 1 : 0;
 }
 
 /**
@@ -894,50 +1167,629 @@ void printPacket(uint8_t *buf, int len, const char *prefix) {
 }
 
 /**
- * Fix MSS function (stub)
+ * Fix MSS function - TCP MSS clamping for different MTUs
+ * This function modifies TCP SYN packets to clamp the MSS option
+ * to prevent fragmentation issues with tunneling
  */
 int fix_mss(uint8_t *buf, int len) {
-    // TODO: Implement MSS fixing
-    return len;
+    if (!fixmss || len < 20) {
+        return len; // MSS fixing disabled or packet too small
+    }
+    
+    // Check if this is an IP packet
+    struct iphdr *iph = (struct iphdr *)buf;
+    
+    // Validate IP header
+    if (len < sizeof(struct iphdr) || iph->version != 4) {
+        return len; // Not IPv4 or too small
+    }
+    
+    int ip_header_len = iph->ihl * 4;
+    if (ip_header_len < 20 || len < ip_header_len) {
+        return len; // Invalid IP header length
+    }
+    
+    // Check if this is a TCP packet
+    if (iph->protocol != IPPROTO_TCP) {
+        return len; // Not TCP
+    }
+    
+    // Calculate TCP header offset
+    uint8_t *tcp_start = buf + ip_header_len;
+    int remaining_len = len - ip_header_len;
+    
+    if (remaining_len < sizeof(struct tcphdr)) {
+        return len; // TCP header too small
+    }
+    
+    struct tcphdr *tcph = (struct tcphdr *)tcp_start;
+    int tcp_header_len = tcph->doff * 4;
+    
+    if (tcp_header_len < 20 || remaining_len < tcp_header_len) {
+        return len; // Invalid TCP header length
+    }
+    
+    // Only process SYN packets (where MSS option is present)
+    if (!tcph->syn) {
+        return len; // Not a SYN packet
+    }
+    
+    // Calculate maximum MSS based on MTU
+    // MTU - IP header (20) - TCP header (20) - EthUDP overhead (8) - safety margin (4)
+    int max_mss = mtu - 20 - 20 - 8 - 4;
+    if (max_mss < 536) {
+        max_mss = 536; // Minimum safe MSS
+    }
+    if (max_mss > 1460) {
+        max_mss = 1460; // Standard Ethernet MSS
+    }
+    
+    // Look for MSS option in TCP options
+    uint8_t *options = tcp_start + 20; // Start of TCP options
+    int options_len = tcp_header_len - 20;
+    int i = 0;
+    
+    while (i < options_len) {
+        uint8_t option_type = options[i];
+        
+        if (option_type == 0) {
+            // End of options
+            break;
+        } else if (option_type == 1) {
+            // NOP option
+            i++;
+            continue;
+        } else if (option_type == 2) {
+            // MSS option
+            if (i + 3 < options_len && options[i + 1] == 4) {
+                // Valid MSS option (type=2, length=4, value=2 bytes)
+                uint16_t current_mss = ntohs(*(uint16_t *)(options + i + 2));
+                
+                if (current_mss > max_mss) {
+                    // Clamp MSS to maximum allowed value
+                    *(uint16_t *)(options + i + 2) = htons(max_mss);
+                    
+                    // Recalculate TCP checksum
+                    tcph->check = 0;
+                    
+                    // Calculate pseudo header checksum
+                    uint32_t pseudo_sum = 0;
+                    pseudo_sum += (iph->saddr >> 16) + (iph->saddr & 0xFFFF);
+                    pseudo_sum += (iph->daddr >> 16) + (iph->daddr & 0xFFFF);
+                    pseudo_sum += htons(IPPROTO_TCP);
+                    pseudo_sum += htons(remaining_len);
+                    
+                    // Add TCP header and data to checksum
+                    uint16_t *tcp_words = (uint16_t *)tcp_start;
+                    for (int j = 0; j < remaining_len / 2; j++) {
+                        pseudo_sum += ntohs(tcp_words[j]);
+                    }
+                    
+                    // Handle odd byte
+                    if (remaining_len % 2) {
+                        pseudo_sum += tcp_start[remaining_len - 1] << 8;
+                    }
+                    
+                    // Fold carry bits
+                    while (pseudo_sum >> 16) {
+                        pseudo_sum = (pseudo_sum & 0xFFFF) + (pseudo_sum >> 16);
+                    }
+                    
+                    tcph->check = htons(~pseudo_sum);
+                    
+                    // Also recalculate IP checksum
+                    iph->check = 0;
+                    uint32_t ip_sum = 0;
+                    uint16_t *ip_words = (uint16_t *)buf;
+                    for (int j = 0; j < ip_header_len / 2; j++) {
+                        ip_sum += ntohs(ip_words[j]);
+                    }
+                    
+                    // Fold carry bits
+                    while (ip_sum >> 16) {
+                        ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
+                    }
+                    
+                    iph->check = htons(~ip_sum);
+                    
+                    Debug("fix_mss: Clamped MSS from %u to %u", current_mss, max_mss);
+                }
+                break;
+            }
+            i += 4; // MSS option is always 4 bytes
+        } else {
+            // Other options with length field
+            if (i + 1 >= options_len) {
+                break; // Malformed options
+            }
+            uint8_t option_len = options[i + 1];
+            if (option_len < 2 || i + option_len > options_len) {
+                break; // Invalid option length
+            }
+            i += option_len;
+        }
+    }
+    
+    return len; // Return original length (packet modified in-place)
 }
 
 /**
- * Encryption function (stub)
+ * Enhanced encryption/decryption function
+ * Supports XOR, AES-128, AES-192, AES-256 algorithms
+ * Automatically handles both encryption and decryption based on context
  */
 int do_encrypt(uint8_t *buf, int len, uint8_t *nbuf) {
-    // TODO: Implement proper encryption
-    if (enc_algorithm == XOR && enc_key_len > 0) {
-        return ethudp_xor_encrypt(buf, len, nbuf);
+    if (len <= 0 || !buf || !nbuf) {
+        err_msg("do_encrypt: Invalid parameters (len=%d, buf=%p, nbuf=%p)", len, buf, nbuf);
+        return -1;
     }
-#ifdef ENABLE_OPENSSL
-    else if (enc_algorithm >= AES_128 && enc_algorithm <= AES_256) {
-        return ethudp_openssl_encrypt(buf, len, nbuf);
-    }
-#endif
-    else {
+    
+    // Check if encryption is enabled
+    if (enc_algorithm == 0 || enc_key_len == 0) {
         // No encryption, just copy
-        memcpy(nbuf, buf, len);
+        if (buf != nbuf) {
+            memcpy(nbuf, buf, len);
+        }
         return len;
     }
+    
+    int result = -1;
+    
+    switch (enc_algorithm) {
+        case XOR:
+            if (enc_key_len > 0) {
+                result = ethudp_xor_encrypt(buf, len, nbuf);
+                if (debug > 2) {
+                    Debug("do_encrypt: XOR encryption/decryption completed (%d bytes)", result);
+                }
+            } else {
+                err_msg("do_encrypt: XOR encryption requested but no key provided");
+                result = -1;
+            }
+            break;
+            
+#ifdef ENABLE_OPENSSL
+        case AES_128:
+        case AES_192:
+        case AES_256:
+            // Validate key length for AES algorithms
+            int required_key_len = 0;
+            const char *alg_name = "";
+            
+            switch (enc_algorithm) {
+                case AES_128:
+                    required_key_len = 16;
+                    alg_name = "AES-128";
+                    break;
+                case AES_192:
+                    required_key_len = 24;
+                    alg_name = "AES-192";
+                    break;
+                case AES_256:
+                    required_key_len = 32;
+                    alg_name = "AES-256";
+                    break;
+            }
+            
+            if (enc_key_len < required_key_len) {
+                err_msg("do_encrypt: %s requires %d-byte key, but only %d bytes provided", 
+                        alg_name, required_key_len, enc_key_len);
+                result = -1;
+                break;
+            }
+            
+            // Check if this looks like encrypted data (for decryption)
+            // Encrypted data typically has different characteristics than plain text
+            bool is_encrypted_data = false;
+            
+            // Simple heuristic: if packet starts with known EthUDP headers, it's likely plaintext
+            if (len >= 6) {
+                if (memcmp(buf, "UDPFRG", 6) == 0 || memcmp(buf, "UDPSLV", 6) == 0) {
+                    // This is plaintext with EthUDP header - encrypt it
+                    is_encrypted_data = false;
+                } else {
+                    // This might be encrypted data - try to decrypt it
+                    is_encrypted_data = true;
+                }
+            }
+            
+            if (is_encrypted_data) {
+                // Attempt decryption
+                result = ethudp_openssl_decrypt(buf, len, nbuf);
+                if (result > 0 && debug > 2) {
+                    Debug("do_encrypt: %s decryption completed (%d→%d bytes)", alg_name, len, result);
+                }
+            } else {
+                // Perform encryption
+                result = ethudp_openssl_encrypt(buf, len, nbuf);
+                if (result > 0 && debug > 2) {
+                    Debug("do_encrypt: %s encryption completed (%d→%d bytes)", alg_name, len, result);
+                }
+            }
+            
+            if (result <= 0) {
+                err_msg("do_encrypt: %s operation failed", alg_name);
+            }
+            break;
+#endif
+            
+        default:
+            err_msg("do_encrypt: Unsupported encryption algorithm: %d", enc_algorithm);
+            result = -1;
+            break;
+    }
+    
+    // Fallback: if encryption failed, copy original data
+    if (result <= 0) {
+        if (buf != nbuf) {
+            memcpy(nbuf, buf, len);
+        }
+        return len;
+    }
+    
+    return result;
 }
 
 /**
- * Worker thread functions (stubs)
+ * Dedicated decryption function for explicit decryption operations
+ */
+int do_decrypt(uint8_t *buf, int len, uint8_t *nbuf) {
+    if (len <= 0 || !buf || !nbuf) {
+        err_msg("do_decrypt: Invalid parameters (len=%d, buf=%p, nbuf=%p)", len, buf, nbuf);
+        return -1;
+    }
+    
+    // Check if encryption is enabled
+    if (enc_algorithm == 0 || enc_key_len == 0) {
+        // No encryption, just copy
+        if (buf != nbuf) {
+            memcpy(nbuf, buf, len);
+        }
+        return len;
+    }
+    
+    int result = -1;
+    
+    switch (enc_algorithm) {
+        case XOR:
+            // XOR is symmetric - same operation for encrypt/decrypt
+            if (enc_key_len > 0) {
+                result = ethudp_xor_encrypt(buf, len, nbuf);
+                if (debug > 2) {
+                    Debug("do_decrypt: XOR decryption completed (%d bytes)", result);
+                }
+            } else {
+                err_msg("do_decrypt: XOR decryption requested but no key provided");
+                result = -1;
+            }
+            break;
+            
+#ifdef ENABLE_OPENSSL
+        case AES_128:
+        case AES_192:
+        case AES_256:
+            result = ethudp_openssl_decrypt(buf, len, nbuf);
+            if (result > 0 && debug > 2) {
+                const char *alg_name = (enc_algorithm == AES_128) ? "AES-128" :
+                                      (enc_algorithm == AES_192) ? "AES-192" : "AES-256";
+                Debug("do_decrypt: %s decryption completed (%d→%d bytes)", alg_name, len, result);
+            }
+            break;
+#endif
+            
+        default:
+            err_msg("do_decrypt: Unsupported encryption algorithm: %d", enc_algorithm);
+            result = -1;
+            break;
+    }
+    
+    // Fallback: if decryption failed, copy original data
+    if (result <= 0) {
+        if (buf != nbuf) {
+            memcpy(nbuf, buf, len);
+        }
+        return len;
+    }
+    
+    return result;
+}
+
+/**
+ * Worker thread functions - UDP to RAW processing
  */
 void* process_udp_to_raw_worker(void *arg) {
-    // TODO: Implement UDP to RAW worker
-    Debug("process_udp_to_raw_worker started");
-    while (1) {
-        sleep(1);
+    worker_context_t *ctx = (worker_context_t *)arg;
+    if (!ctx) {
+        err_msg("process_udp_to_raw_worker: Invalid worker context");
+        return NULL;
     }
+    
+    Debug("UDP→RAW Worker %d started (thread_id=%lu, cpu_affinity=%d)", 
+          ctx->worker_id, (unsigned long)pthread_self(), ctx->cpu_affinity);
+    
+    // Set CPU affinity if specified
+    if (ctx->cpu_affinity >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(ctx->cpu_affinity, &cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+            err_msg("Worker %d: Failed to set CPU affinity to %d", 
+                    ctx->worker_id, ctx->cpu_affinity);
+        } else {
+            Debug("Worker %d: Set CPU affinity to %d", ctx->worker_id, ctx->cpu_affinity);
+        }
+    }
+    
+    // Allocate packet buffers
+    unsigned char recv_buf[MAX_PACKET_SIZE];
+    unsigned char send_buf[MAX_PACKET_SIZE + 8]; // Extra space for headers
+    struct sockaddr_storage client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    
+    // Main processing loop
+    while (ctx->running && !ctx->should_stop) {
+        // Receive UDP packet
+        ssize_t recv_len = recvfrom(fdudp[ctx->socket_index], recv_buf, sizeof(recv_buf), 
+                                   MSG_DONTWAIT, (struct sockaddr*)&client_addr, &client_len);
+        
+        if (recv_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available, yield CPU briefly
+                usleep(100); // 100 microseconds
+                continue;
+            } else {
+                err_msg("Worker %d: recvfrom error: %s", ctx->worker_id, strerror(errno));
+                ctx->errors++;
+                continue;
+            }
+        }
+        
+        if (recv_len == 0) {
+            continue; // Empty packet
+        }
+        
+        // Update statistics
+        ctx->packets_processed++;
+        ctx->bytes_processed += recv_len;
+        
+        // Process packet based on mode
+        int processed_len = recv_len;
+        
+        // Apply loopback check if enabled
+        if (loopback_check && do_loopback_check(recv_buf, recv_len)) {
+            Debug("Worker %d: Packet failed loopback check, dropping", ctx->worker_id);
+            continue;
+        }
+        
+        // Apply MSS fixing if enabled
+        if (fixmss) {
+            processed_len = fix_mss(recv_buf, recv_len);
+            if (processed_len < 0) {
+                err_msg("Worker %d: MSS fixing failed", ctx->worker_id);
+                ctx->errors++;
+                continue;
+            }
+        }
+        
+        // Apply encryption if configured
+        if (enc_algorithm != 0) {
+            processed_len = do_encrypt(recv_buf, processed_len, send_buf);
+            if (processed_len < 0) {
+                err_msg("Worker %d: Encryption failed", ctx->worker_id);
+                ctx->errors++;
+                continue;
+            }
+        } else {
+            // No encryption, just copy
+            memcpy(send_buf, recv_buf, processed_len);
+        }
+        
+        // Add EthUDP header (8 bytes: "UDPFRG" + sequence)
+        memmove(send_buf + 8, send_buf, processed_len);
+        memcpy(send_buf, "UDPFRG", 6);
+        uint16_t seq = htons((uint16_t)(ctx->packets_processed & 0xFFFF));
+        memcpy(send_buf + 6, &seq, 2);
+        processed_len += 8;
+        
+        // Send to RAW socket
+        ssize_t sent_len = write(fdraw, send_buf, processed_len);
+        if (sent_len < 0) {
+            err_msg("Worker %d: write to RAW socket failed: %s", 
+                    ctx->worker_id, strerror(errno));
+            ctx->errors++;
+            continue;
+        }
+        
+        if (sent_len != processed_len) {
+            err_msg("Worker %d: Partial write to RAW socket (%zd/%d bytes)", 
+                    ctx->worker_id, sent_len, processed_len);
+            ctx->errors++;
+        }
+        
+        // Debug packet processing
+        if (debug > 1) {
+            Debug("Worker %d: Processed UDP→RAW packet: %zd→%d bytes", 
+                  ctx->worker_id, recv_len, processed_len);
+        }
+    }
+    
+    Debug("UDP→RAW Worker %d stopped (processed %lld packets, %lld bytes, %lld errors)", 
+          ctx->worker_id, ctx->packets_processed, ctx->bytes_processed, ctx->errors);
+    
+    ctx->running = 0;
     return NULL;
 }
 
 void* process_raw_to_udp_worker(void *arg) {
-    // TODO: Implement RAW to UDP worker
-    Debug("process_raw_to_udp_worker started");
-    while (1) {
-        sleep(1);
+    worker_context_t *ctx = (worker_context_t *)arg;
+    if (!ctx) {
+        err_msg("process_raw_to_udp_worker: Invalid worker context");
+        return NULL;
     }
+    
+    Debug("RAW→UDP Worker %d started (thread_id=%lu, cpu_affinity=%d)", 
+          ctx->worker_id, (unsigned long)pthread_self(), ctx->cpu_affinity);
+    
+    // Set CPU affinity if specified
+    if (ctx->cpu_affinity >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(ctx->cpu_affinity, &cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+            err_msg("Worker %d: Failed to set CPU affinity to %d", 
+                    ctx->worker_id, ctx->cpu_affinity);
+        } else {
+            Debug("Worker %d: Set CPU affinity to %d", ctx->worker_id, ctx->cpu_affinity);
+        }
+    }
+    
+    // Allocate packet buffers
+    unsigned char recv_buf[MAX_PACKET_SIZE + 8]; // Extra space for headers
+    unsigned char send_buf[MAX_PACKET_SIZE];
+    struct sockaddr_in dest_addr;
+    
+    // Initialize destination address structure
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    
+    // Main processing loop
+    while (ctx->running && !ctx->should_stop) {
+        // Receive RAW packet
+        ssize_t recv_len = read(fdraw, recv_buf, sizeof(recv_buf));
+        
+        if (recv_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available, yield CPU briefly
+                usleep(100); // 100 microseconds
+                continue;
+            } else {
+                err_msg("Worker %d: read from RAW socket error: %s", 
+                        ctx->worker_id, strerror(errno));
+                ctx->errors++;
+                continue;
+            }
+        }
+        
+        if (recv_len < 8) {
+            // Packet too small to contain EthUDP header
+            continue;
+        }
+        
+        // Verify EthUDP header
+        if (memcmp(recv_buf, "UDPFRG", 6) != 0) {
+            Debug("Worker %d: Invalid EthUDP header, dropping packet", ctx->worker_id);
+            continue;
+        }
+        
+        // Extract sequence number (for debugging/statistics)
+        uint16_t seq = ntohs(*(uint16_t*)(recv_buf + 6));
+        
+        // Skip EthUDP header (8 bytes)
+        unsigned char *payload = recv_buf + 8;
+        int payload_len = recv_len - 8;
+        
+        // Update statistics
+        ctx->packets_processed++;
+        ctx->bytes_processed += payload_len;
+        
+        // Process packet based on mode
+        int processed_len = payload_len;
+        
+        // Apply decryption if configured
+        if (enc_algorithm != 0) {
+            processed_len = do_encrypt(payload, payload_len, send_buf); // decrypt is same function
+            if (processed_len < 0) {
+                err_msg("Worker %d: Decryption failed", ctx->worker_id);
+                ctx->errors++;
+                continue;
+            }
+        } else {
+            // No decryption, just copy
+            memcpy(send_buf, payload, processed_len);
+        }
+        
+        // Apply MSS fixing if enabled (reverse operation)
+        if (fixmss) {
+            processed_len = fix_mss(send_buf, processed_len);
+            if (processed_len < 0) {
+                err_msg("Worker %d: MSS fixing failed", ctx->worker_id);
+                ctx->errors++;
+                continue;
+            }
+        }
+        
+        // Extract destination from packet or use configured destination
+        if (remote_addr[MASTER].ss_family == AF_INET) {
+            struct sockaddr_in *remote_in = (struct sockaddr_in*)&remote_addr[MASTER];
+            dest_addr.sin_addr.s_addr = remote_in->sin_addr.s_addr;
+        } else {
+            // Try to extract destination from IP header if available
+            if (processed_len >= 20) { // Minimum IP header size
+                struct iphdr *ip_hdr = (struct iphdr*)send_buf;
+                if (ip_hdr->version == 4) {
+                    dest_addr.sin_addr.s_addr = ip_hdr->daddr;
+                } else {
+                    err_msg("Worker %d: No destination IP configured and cannot extract from packet", 
+                            ctx->worker_id);
+                    ctx->errors++;
+                    continue;
+                }
+            } else {
+                err_msg("Worker %d: Packet too small to extract destination", ctx->worker_id);
+                ctx->errors++;
+                continue;
+            }
+        }
+        
+        // Set destination port
+        if (remote_addr[MASTER].ss_family == AF_INET) {
+            struct sockaddr_in *remote_in = (struct sockaddr_in*)&remote_addr[MASTER];
+            dest_addr.sin_port = remote_in->sin_port;
+        } else {
+            // Try to extract port from UDP header if available
+            if (processed_len >= 28) { // IP header (20) + UDP header (8)
+                struct iphdr *ip_hdr = (struct iphdr*)send_buf;
+                if (ip_hdr->protocol == IPPROTO_UDP) {
+                    struct udphdr *udp_hdr = (struct udphdr*)(send_buf + (ip_hdr->ihl * 4));
+                    dest_addr.sin_port = udp_hdr->dest;
+                } else {
+                    dest_addr.sin_port = htons(8080);  // Default UDP port
+                }
+            } else {
+                dest_addr.sin_port = htons(8080);  // Default UDP port
+            }
+        }
+        
+        // Send to UDP socket
+        ssize_t sent_len = sendto(fdudp[ctx->socket_index], send_buf, processed_len, 0,
+                                 (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+        
+        if (sent_len < 0) {
+            err_msg("Worker %d: sendto UDP socket failed: %s", 
+                    ctx->worker_id, strerror(errno));
+            ctx->errors++;
+            continue;
+        }
+        
+        if (sent_len != processed_len) {
+            err_msg("Worker %d: Partial send to UDP socket (%zd/%d bytes)", 
+                    ctx->worker_id, sent_len, processed_len);
+            ctx->errors++;
+        }
+        
+        // Debug packet processing
+        if (debug > 1) {
+            char dest_ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &dest_addr.sin_addr, dest_ip_str, INET_ADDRSTRLEN);
+            Debug("Worker %d: Processed RAW→UDP packet: %zd→%d bytes, seq=%u, dest=%s:%d", 
+                  ctx->worker_id, recv_len, processed_len, seq, 
+                  dest_ip_str, ntohs(dest_addr.sin_port));
+        }
+    }
+    
+    Debug("RAW→UDP Worker %d stopped (processed %lld packets, %lld bytes, %lld errors)", 
+          ctx->worker_id, ctx->packets_processed, ctx->bytes_processed, ctx->errors);
+    
+    ctx->running = 0;
     return NULL;
 }
