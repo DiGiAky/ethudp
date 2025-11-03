@@ -412,7 +412,7 @@ typedef struct {
     char local_port[32];        // Local port
     char remote_host[256];      // Remote host address
     char remote_port[32];       // Remote port
-    char dev_name[64];          // Device name
+    char dev_name[IFNAMSIZ];    // Device name
     char name[256];             // Name/identifier
     char run_cmd[256];          // Command to run
     

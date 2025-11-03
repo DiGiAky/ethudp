@@ -8,7 +8,7 @@
 // External variables from original code
 extern int fdudp[2];
 extern int fdraw;
-extern int debug;
+extern volatile int debug;
 extern int got_signal;
 extern volatile int pool_running;
 

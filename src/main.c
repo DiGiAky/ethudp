@@ -25,7 +25,7 @@ int daemon_proc = 0;
 volatile int debug = 0;
 int mode = -1;
 int mtu = 0;
-int udp_frg_seq = 0;
+uint16_t udp_frg_seq = 0;
 int master_slave = 0;
 int read_only = 0, write_only = 0;
 int fixmss = 0;
@@ -951,7 +951,7 @@ int main(int argc, char *argv[])
     strncpy(run_cmd, config.run_cmd, MAXLEN - 1);
     strncpy(dev_name, config.dev_name, IFNAMSIZ - 1);
     strncpy(mypassword, config.password, MAXLEN - 1);
-    memcpy(enc_key, config.enc_key, MAXLEN);
+    memcpy(enc_key, config.enc_key, sizeof(config.enc_key));
     
     // Copy global config
     global_config.mode = config.mode;
@@ -1115,15 +1115,13 @@ void* process_udp_to_raw_master(void *arg)
         }
         
         // Debug packet processing
-        if (debug > 1) {
-            Debug("process_udp_to_raw_master: Processed UDP→RAW packet: %zd→%d bytes, seq=%u", 
+        Debug_Hot("process_udp_to_raw_master: Processed UDP→RAW packet: %zd→%d bytes, seq=%u", 
                   recv_len, processed_len, ntohs(seq));
-        }
         
         // Periodic statistics reporting
-        if (debug && (packets_processed % 1000 == 0)) {
-            Debug("process_udp_to_raw_master: Processed %lld packets, %lld bytes, %lld errors", 
-                  packets_processed, bytes_processed, errors);
+        if (__builtin_expect((packets_processed % 1000 == 0), 0)) {
+            Debug_Stats("process_udp_to_raw_master: Processed %lld packets, %lld bytes, %lld errors", 
+                       packets_processed, bytes_processed, errors);
         }
     }
     
@@ -1242,18 +1240,16 @@ void* process_udp_to_raw_slave(void *arg)
         }
         
         // Debug packet processing
-        if (debug > 1) {
-            Debug("process_udp_to_raw_slave: Processed UDP→RAW packet: %zd→%d bytes, seq=%u (SLAVE MODE)", 
+        Debug_Hot("process_udp_to_raw_slave: Processed UDP→RAW packet: %zd→%d bytes, seq=%u (SLAVE MODE)", 
                   recv_len, processed_len, ntohs(seq));
-        }
         
         // Update slave status to indicate activity
         slave_status = STATUS_OK;
         
         // Periodic statistics reporting
-        if (debug && (packets_processed % 1000 == 0)) {
-            Debug("process_udp_to_raw_slave: Processed %lld packets, %lld bytes, %lld errors (SLAVE MODE)", 
-                  packets_processed, bytes_processed, errors);
+        if (__builtin_expect((packets_processed % 1000 == 0), 0)) {
+            Debug_Stats("process_udp_to_raw_slave: Processed %lld packets, %lld bytes, %lld errors (SLAVE MODE)", 
+                       packets_processed, bytes_processed, errors);
         }
     }
     
@@ -1331,12 +1327,14 @@ void* send_keepalive_to_udp(void *arg)
             } else {
                 keepalives_sent++;
                 
-                if (debug > 1) {
-                    Debug("send_keepalive_to_udp: Sent keepalive to remote %d (seq=%u, mode=%s, status=%s)", 
-                          remote_idx, ntohl(keepalive.sequence),
-                          (current_remote == MASTER) ? "MASTER" : "SLAVE",
-                          ((current_remote == MASTER) ? master_status : slave_status) == STATUS_OK ? "OK" : "BAD");
+#ifdef DEBUG
+                if (__builtin_expect(debug > 1, 0)) {
+                    Debug_Hot("send_keepalive_to_udp: Sent keepalive to remote %d (seq=%u, mode=%s, status=%s)", 
+                              remote_idx, ntohl(keepalive.sequence),
+                              (current_remote == MASTER) ? "MASTER" : "SLAVE",
+                              ((current_remote == MASTER) ? master_status : slave_status) == STATUS_OK ? "OK" : "BAD");
                 }
+#endif
             }
         }
         
@@ -1412,7 +1410,7 @@ void process_raw_to_udp(void)
         }
         
         // Extract sequence number (for debugging/statistics)
-        uint16_t seq = ntohs(*(uint16_t*)(recv_buf + 6));
+        uint16_t seq __attribute__((unused)) = ntohs(*(uint16_t*)(recv_buf + 6));
         
         // Skip EthUDP header (8 bytes)
         unsigned char *payload = recv_buf + 8;
@@ -1506,17 +1504,19 @@ void process_raw_to_udp(void)
         }
         
         // Debug packet processing
-        if (debug > 1) {
+#ifdef DEBUG
+        if (__builtin_expect(debug > 1, 0)) {
             char dest_ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &dest_addr.sin_addr, dest_ip_str, INET_ADDRSTRLEN);
-            Debug("process_raw_to_udp: Processed RAW→UDP packet: %zd→%d bytes, seq=%u, dest=%s:%d", 
-                  recv_len, processed_len, seq, dest_ip_str, ntohs(dest_addr.sin_port));
+            Debug_Hot("process_raw_to_udp: Processed RAW→UDP packet: %zd→%d bytes, seq=%u, dest=%s:%d", 
+                      recv_len, processed_len, seq, dest_ip_str, ntohs(dest_addr.sin_port));
         }
+#endif
         
         // Periodic statistics reporting
-        if (debug && (packets_processed % 1000 == 0)) {
-            Debug("process_raw_to_udp: Processed %lld packets, %lld bytes, %lld errors", 
-                  packets_processed, bytes_processed, errors);
+        if (__builtin_expect((packets_processed % 1000 == 0), 0)) {
+            Debug_Stats("process_raw_to_udp: Processed %lld packets, %lld bytes, %lld errors", 
+                       packets_processed, bytes_processed, errors);
         }
     }
     

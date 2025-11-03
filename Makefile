@@ -37,24 +37,27 @@ MODULAR_HEADERS = $(INCDIR)/ethudp_common.h \
                   $(INCDIR)/ethudp_metrics.h \
                   $(INCDIR)/ethudp_stats.h
 
-MODULAR_OBJECTS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(MODULAR_SOURCES))
+# Object file variables for different build types
+MODULAR_OBJECTS_DEBUG = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.debug.o,$(MODULAR_SOURCES))
+MODULAR_OBJECTS_OPTIMIZED = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.opt.o,$(MODULAR_SOURCES))
+MODULAR_OBJECTS_RELEASE = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.rel.o,$(MODULAR_SOURCES))
 
 # Default target (modular debug build)
-EthUDP: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS)
-	$(CC) $(CFLAGS_DEBUG) -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS) $(LIBS)
+EthUDP: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS_DEBUG)
+	$(CC) $(CFLAGS_DEBUG) -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS_DEBUG) $(LIBS)
 
 # Modular optimized release build
-run: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS)
-	$(CC) $(CFLAGS_OPTIMIZED) -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS) $(LIBS)
+run: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS_OPTIMIZED)
+	$(CC) $(CFLAGS_OPTIMIZED) -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS_OPTIMIZED) $(LIBS)
 
 # Modular performance optimized build for production
-production: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS)
-	$(CC) $(CFLAGS_OPTIMIZED) -DNDEBUG -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS) $(LIBS)
+production: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS_OPTIMIZED)
+	$(CC) $(CFLAGS_OPTIMIZED) -DNDEBUG -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS_OPTIMIZED) $(LIBS)
 	strip $(BINDIR)/EthUDP
 
 # Modular build without NUMA support (fallback for systems without libnuma)
-no-numa: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS)
-	$(CC) $(CFLAGS_RELEASE) -DENABLE_SO_REUSEPORT -DENABLE_CPU_AFFINITY -DENABLE_BATCH_PROCESSING -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS) -lpthread -lssl -llz4 -lcrypto -lpcap
+no-numa: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS_RELEASE)
+	$(CC) $(CFLAGS_RELEASE) -DENABLE_SO_REUSEPORT -DENABLE_CPU_AFFINITY -DENABLE_BATCH_PROCESSING -o $(BINDIR)/EthUDP $(MODULAR_OBJECTS_RELEASE) -lpthread -lssl -llz4 -lcrypto -lpcap
 
 
 
@@ -65,18 +68,24 @@ $(OBJDIR):
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
-# Object file compilation rules
-$(OBJDIR)/%.o: $(SRCDIR)/%.c $(MODULAR_HEADERS) | $(OBJDIR)
+# Object file compilation rules for different build types
+
+# Debug object files
+$(OBJDIR)/%.debug.o: $(SRCDIR)/%.c $(MODULAR_HEADERS) | $(OBJDIR)
 	$(CC) $(CFLAGS_DEBUG) -c $< -o $@
 
 # Optimized object files for release builds
 $(OBJDIR)/%.opt.o: $(SRCDIR)/%.c $(MODULAR_HEADERS) | $(OBJDIR)
 	$(CC) $(CFLAGS_OPTIMIZED) -c $< -o $@
 
+# Release object files (without NUMA)
+$(OBJDIR)/%.rel.o: $(SRCDIR)/%.c $(MODULAR_HEADERS) | $(OBJDIR)
+	$(CC) $(CFLAGS_RELEASE) -c $< -o $@
+
 # Clean build artifacts
 clean:
 	rm -rf $(BUILDDIR)
-	rm -f *.o *.opt.o core
+	rm -f *.o *.opt.o *.debug.o *.rel.o core
 
 # Install to system (requires root)
 install: production
@@ -97,8 +106,8 @@ check-deps:
 	@ldconfig -p | grep -q libnuma && echo "✓ NUMA support found" || echo "✗ NUMA support missing (use 'make no-numa')"
 
 # Performance test build (modular)
-test: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS)
-	$(CC) $(CFLAGS_OPTIMIZED) -DBENCHMARK -o $(BINDIR)/EthUDP-test $(MODULAR_OBJECTS) $(LIBS)
+test: $(OBJDIR) $(BINDIR) $(MODULAR_OBJECTS_OPTIMIZED)
+	$(CC) $(CFLAGS_OPTIMIZED) -DBENCHMARK -o $(BINDIR)/EthUDP-test $(MODULAR_OBJECTS_OPTIMIZED) $(LIBS)
 
 # Static analysis
 analyze:

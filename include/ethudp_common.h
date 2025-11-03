@@ -168,15 +168,41 @@ struct vlan_tag {
 // Version information
 extern const char *VERSION;
 
-// Debug macros
+// Debug macros - optimized for performance
 #ifdef DEBUG
+extern volatile int debug;
 #define Debug(fmt, ...) do { \
-    if (debug) { \
+    if (__builtin_expect(debug, 0)) { \
         fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__); \
     } \
 } while(0)
+
+// Debug levels for fine-grained control
+#define Debug_Level(level, fmt, ...) do { \
+    if (__builtin_expect(debug >= (level), 0)) { \
+        fprintf(stderr, "[DEBUG%d] " fmt "\n", (level), ##__VA_ARGS__); \
+    } \
+} while(0)
+
+// Conditional debug for hot paths
+#define Debug_Hot(fmt, ...) do { \
+    if (__builtin_expect(debug > 1, 0)) { \
+        fprintf(stderr, "[DEBUG-HOT] " fmt "\n", ##__VA_ARGS__); \
+    } \
+} while(0)
+
+// Statistics debug (less frequent)
+#define Debug_Stats(fmt, ...) do { \
+    if (__builtin_expect(debug, 0)) { \
+        fprintf(stderr, "[DEBUG-STATS] " fmt "\n", ##__VA_ARGS__); \
+    } \
+} while(0)
 #else
+// In release builds, all debug macros compile to nothing
 #define Debug(fmt, ...) do { } while(0)
+#define Debug_Level(level, fmt, ...) do { } while(0)
+#define Debug_Hot(fmt, ...) do { } while(0)
+#define Debug_Stats(fmt, ...) do { } while(0)
 #endif
 
 // Error handling macros (for compatibility with old code)

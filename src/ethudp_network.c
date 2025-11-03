@@ -9,7 +9,7 @@ extern int fdudp[2];
 extern int fdraw;
 extern int ifindex;
 extern int nat[2];
-extern int debug;
+extern volatile int debug;
 extern int mode;
 extern int master_slave;
 extern int current_remote;
@@ -26,7 +26,7 @@ extern int remote_vlan[4096];
 extern char enc_key[MAXLEN];
 extern int enc_key_len;
 extern int enc_algorithm;
-extern char enc_iv[16];
+extern unsigned char enc_iv[EVP_MAX_IV_LENGTH];
 extern struct sockaddr_storage local_addr[2];
 extern struct sockaddr_storage remote_addr[2];
 extern struct sockaddr_storage cmd_remote_addr[2];
@@ -142,11 +142,11 @@ int ethudp_udp_xconnect(char *lhost, char *lserv, char *rhost, char *rserv, int 
  * Open a raw socket for the network interface
  */
 int ethudp_open_rawsocket(char *ifname, int32_t *rifindex) {
-    unsigned char buf[MAX_PACKET_SIZE];
+    unsigned char buf[MAX_PACKET_SIZE] __attribute__((unused));
     int32_t ifindex;
     struct ifreq ifr;
     struct sockaddr_ll sll;
-    int n;
+    int n __attribute__((unused));
 
     int32_t fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd == -1)
@@ -308,7 +308,7 @@ void ethudp_send_udp_to_remote(uint8_t *buf, int len, int index) {
         return ethudp_send_frag_udp(buf, len, index);
         
     if (nat[index]) {
-        char rip[200];
+        char rip[200] __attribute__((unused));
         if (remote_addr[index].ss_family == AF_INET) {
             struct sockaddr_in *r = (struct sockaddr_in *)(&remote_addr[index]);
             if (debug)
@@ -1007,7 +1007,7 @@ int do_loopback_check(uint8_t *buf, int len) {
     // Check for EthUDP header first
     if (len >= 8 && memcmp(buf, "UDPFRG", 6) == 0) {
         // This is an EthUDP packet - check sequence number
-        uint16_t seq = ntohs(*(uint16_t*)(buf + 6));
+        uint16_t seq __attribute__((unused)) = ntohs(*(uint16_t*)(buf + 6));
         
         // Skip EthUDP header for further analysis
         buf += 8;
@@ -1339,9 +1339,11 @@ int do_encrypt(uint8_t *buf, int len, uint8_t *nbuf) {
         case XOR:
             if (enc_key_len > 0) {
                 result = ethudp_xor_encrypt(buf, len, nbuf);
-                if (debug > 2) {
-                    Debug("do_encrypt: XOR encryption/decryption completed (%d bytes)", result);
+#ifdef DEBUG
+                if (__builtin_expect(debug > 2, 0)) {
+                    Debug_Hot("do_encrypt: XOR encryption/decryption completed (%d bytes)", result);
                 }
+#endif
             } else {
                 err_msg("do_encrypt: XOR encryption requested but no key provided");
                 result = -1;
@@ -1455,9 +1457,11 @@ int do_decrypt(uint8_t *buf, int len, uint8_t *nbuf) {
             // XOR is symmetric - same operation for encrypt/decrypt
             if (enc_key_len > 0) {
                 result = ethudp_xor_encrypt(buf, len, nbuf);
-                if (debug > 2) {
-                    Debug("do_decrypt: XOR decryption completed (%d bytes)", result);
+#ifdef DEBUG
+                if (__builtin_expect(debug > 2, 0)) {
+                    Debug_Hot("do_decrypt: XOR decryption completed (%d bytes)", result);
                 }
+#endif
             } else {
                 err_msg("do_decrypt: XOR decryption requested but no key provided");
                 result = -1;
@@ -1470,7 +1474,7 @@ int do_decrypt(uint8_t *buf, int len, uint8_t *nbuf) {
         case AES_256:
             result = ethudp_openssl_decrypt(buf, len, nbuf);
             if (result > 0 && debug > 2) {
-                const char *alg_name = (enc_algorithm == AES_128) ? "AES-128" :
+                const char *alg_name __attribute__((unused)) = (enc_algorithm == AES_128) ? "AES-128" :
                                       (enc_algorithm == AES_192) ? "AES-192" : "AES-256";
                 Debug("do_decrypt: %s decryption completed (%d→%d bytes)", alg_name, len, result);
             }
@@ -1607,10 +1611,12 @@ void* process_udp_to_raw_worker(void *arg) {
         }
         
         // Debug packet processing
-        if (debug > 1) {
-            Debug("Worker %d: Processed UDP→RAW packet: %zd→%d bytes", 
-                  ctx->worker_id, recv_len, processed_len);
+#ifdef DEBUG
+        if (__builtin_expect(debug > 1, 0)) {
+            Debug_Hot("Worker %d: Processed UDP→RAW packet: %zd→%d bytes", 
+                      ctx->worker_id, recv_len, processed_len);
         }
+#endif
     }
     
     Debug("UDP→RAW Worker %d stopped (processed %lld packets, %lld bytes, %lld errors)", 
@@ -1682,7 +1688,7 @@ void* process_raw_to_udp_worker(void *arg) {
         }
         
         // Extract sequence number (for debugging/statistics)
-        uint16_t seq = ntohs(*(uint16_t*)(recv_buf + 6));
+        uint16_t seq __attribute__((unused)) = ntohs(*(uint16_t*)(recv_buf + 6));
         
         // Skip EthUDP header (8 bytes)
         unsigned char *payload = recv_buf + 8;
@@ -1778,13 +1784,15 @@ void* process_raw_to_udp_worker(void *arg) {
         }
         
         // Debug packet processing
-        if (debug > 1) {
+#ifdef DEBUG
+        if (__builtin_expect(debug > 1, 0)) {
             char dest_ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &dest_addr.sin_addr, dest_ip_str, INET_ADDRSTRLEN);
-            Debug("Worker %d: Processed RAW→UDP packet: %zd→%d bytes, seq=%u, dest=%s:%d", 
-                  ctx->worker_id, recv_len, processed_len, seq, 
-                  dest_ip_str, ntohs(dest_addr.sin_port));
+            Debug_Hot("Worker %d: Processed RAW→UDP packet: %zd→%d bytes, seq=%u, dest=%s:%d", 
+                      ctx->worker_id, recv_len, processed_len, seq, 
+                      dest_ip_str, ntohs(dest_addr.sin_port));
         }
+#endif
     }
     
     Debug("RAW→UDP Worker %d stopped (processed %lld packets, %lld bytes, %lld errors)", 

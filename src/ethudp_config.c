@@ -47,10 +47,10 @@ extern int loopback_check;
 extern int write_only;
 extern int nopromisc;
 extern int lz4;
-extern char dev_name[MAXLEN];
+extern char dev_name[IFNAMSIZ];
 extern char run_cmd[MAXLEN];
 extern int run_seconds;
-extern int debug;
+extern volatile int debug;
 extern int vlan_map;
 extern int my_vlan[4096];
 extern char syslog_name[MAXLEN];
@@ -238,8 +238,8 @@ int ethudp_config_parse_args_full(ethudp_config_t *config, int argc, char *argv[
         } else if (strcmp(argv[i], "-dev") == 0) {
             i++;
             if (argc - i <= 0) usage();
-            memset(dev_name, 0, MAXLEN);
-            strncpy(dev_name, argv[i], MAXLEN - 1);
+            memset(dev_name, 0, IFNAMSIZ);
+            strncpy(dev_name, argv[i], IFNAMSIZ - 1);
         } else if (strcmp(argv[i], "-n") == 0) {
             i++;
             if (argc - i <= 0) usage();

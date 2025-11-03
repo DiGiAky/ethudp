@@ -21,7 +21,7 @@
 #include <math.h>
 
 // External references
-extern int debug;
+extern volatile int debug;
 extern dynamic_system_t *global_dynamic_system;
 extern worker_pool_t global_worker_pool;
 
